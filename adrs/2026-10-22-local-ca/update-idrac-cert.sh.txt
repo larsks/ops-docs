@@ -1,0 +1,31 @@
+#!/bin/bash
+
+set -euo pipefail
+
+RACADM=${RACADM:-racadm}
+
+[ $# -ge 1 ] || {
+  echo "ERROR: missing address" >&2
+  exit 1
+}
+IP="$1"
+CN="${2:-$IP}"
+
+USER="${IDRAC_USER:-root}"
+PASS="${IDRAC_PASSWORD:?Set IDRAC_PASSWORD environment variable}"
+CA_CERT="serverca.crt"
+CA_KEY="serverca.key"
+
+$RACADM -r "$IP" -u "$USER" -p "$PASS" set iDRAC.Security.CsrCommonName "$CN"
+$RACADM -r "$IP" -u "$USER" -p "$PASS" set iDRAC.Security.CsrSubjectAltName "$IP"
+$RACADM -r "$IP" -u "$USER" -p "$PASS" set iDRAC.Security.CsrEmailAddr contact@massopen.cloud
+$RACADM -r "$IP" -u "$USER" -p "$PASS" set iDRAC.Security.CsrOrganizationName "Mass Open Cloud"
+$RACADM -r "$IP" -u "$USER" -p "$PASS" set iDRAC.Security.CsrOrganizationUnit "IT"
+$RACADM -r "$IP" -u "$USER" -p "$PASS" set iDRAC.Security.CsrLocalityName Boston
+$RACADM -r "$IP" -u "$USER" -p "$PASS" set iDRAC.Security.CsrStateName "MA"
+$RACADM -r "$IP" -u "$USER" -p "$PASS" get iDRAC.Security
+$RACADM -r "$IP" -u "$USER" -p "$PASS" sslcsrgen -g -f "$IP.csr"
+step certificate sign "$IP.csr" "$CA_CERT" "$CA_KEY" >"$IP.crt"
+cat "$IP.crt" serverca.crt >"$IP.chain"
+$RACADM -r "$IP" -u "$USER" -p "$PASS" sslcertupload -t 1 -f "$IP.chain"
+$RACADM -r "$IP" -u "$USER" -p "$PASS" racreset

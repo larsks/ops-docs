@@ -1,0 +1,90 @@
+#!/bin/bash
+
+set -euo pipefail
+
+[ $# -ge 1 ] || {
+  echo "ERROR: missing address" >&2
+  exit1
+}
+IP="$1"
+CN="${2:-$IP}"
+
+USER="${XCC_USER:-root}"
+PASS="${XCC_PASSWORD:?Set XCC_PASSWORD environment variable}"
+
+CSR_COUNTRY="${CSR_COUNTRY:-US}"
+CSR_STATE="${CSR_STATE:-MA}"
+CSR_CITY="${CSR_CITY:-Boston}"
+CSR_ORG="${CSR_ORG:-Mass Open Cloud}"
+CSR_ORG_UNIT="${CSR_ORG_UNIT:-IT}"
+
+CA_CERT="serverca.crt"
+CA_KEY="serverca.key"
+
+CSR_FILE="${IP}.csr"
+CERT_FILE="${IP}.crt"
+CHAIN_FILE="${IP}.chain"
+
+BASE_URL="https://${IP}/redfish/v1"
+CURL=(curl -sk -u "${USER}:${PASS}")
+
+echo "[*] Looking up HTTPS certificate resource on ${IP}..."
+cert_uri=$("${CURL[@]}" "${BASE_URL}/CertificateService/CertificateLocations" |
+  jq -r '.Links.Certificates[0]."@odata.id" // empty')
+
+if [ -z "$cert_uri" ]; then
+  echo "Could not determine certificate URI from CertificateLocations" >&2
+  exit 1
+fi
+echo "[*] Target certificate resource: ${cert_uri}"
+
+collection_uri="${cert_uri%/*}"
+
+echo "[*] Requesting CSR from ${IP} (CN=${CN})..."
+csr_response=$("${CURL[@]}" \
+  -H "Content-Type: application/json" \
+  -X POST \
+  -d "$(jq -n \
+    --arg cn "$CN" \
+    --arg coll "$collection_uri" \
+    --arg country "$CSR_COUNTRY" \
+    --arg state "$CSR_STATE" \
+    --arg city "$CSR_CITY" \
+    --arg org "$CSR_ORG" \
+    --arg orgunit "$CSR_ORG_UNIT" \
+    '{CommonName: $cn, CertificateCollection: {"@odata.id": $coll},
+          Country: $country, State: $state, City: $city,
+          Organization: $org, OrganizationalUnit: $orgunit}')" \
+  "${BASE_URL}/CertificateService/Actions/CertificateService.GenerateCSR")
+
+csr=$(jq -r '.CSRString // empty' <<<"$csr_response")
+if [ -z "$csr" ]; then
+  echo "Failed to generate CSR. Response was:" >&2
+  echo "$csr_response" >&2
+  exit 1
+fi
+
+printf '%s\n' "$csr" >"$CSR_FILE"
+echo "[*] CSR saved to $CSR_FILE"
+
+echo "[*] Signing CSR with ${CA_CERT}/${CA_KEY}..."
+step certificate sign "$CSR_FILE" "$CA_CERT" "$CA_KEY" >"$CERT_FILE"
+echo "[*] Signed certificate saved to $CERT_FILE"
+
+cat "$CERT_FILE" "$CA_CERT" >"$CHAIN_FILE"
+echo "[*] Chain written to $CHAIN_FILE"
+
+echo "[*] Uploading chain to ${IP}..."
+payload=$(jq -n \
+  --rawfile cert "$CHAIN_FILE" \
+  --arg uri "$cert_uri" \
+  '{CertificateString: $cert, CertificateType: "PEM", CertificateUri: {"@odata.id": $uri}}')
+
+response=$("${CURL[@]}" \
+  -H "Content-Type: application/json" \
+  -X POST \
+  -d "$payload" \
+  "${BASE_URL}/CertificateService/Actions/CertificateService.ReplaceCertificate")
+
+echo "[*] Upload response:"
+jq . <<<"$response" 2>/dev/null || echo "$response"
